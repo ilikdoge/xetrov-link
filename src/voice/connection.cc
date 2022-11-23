@@ -12,6 +12,25 @@
 using namespace xurl;
 using namespace xxlink;
 
+enum xe_rtp_packet_type{
+	XE_RTP_OPUS = 120,
+	XE_RTP_SENDER_REPORT = 200,
+	XE_RTP_RECEIVER_REPORT = 201
+};
+
+enum xe_discord_extension_id{
+	XE_DISCORD_AUDIO_LEVEL = 1,
+	XE_DISCORD_SPEAKING_FLAGS = 9
+};
+
+enum xe_discord_extension_speaking_flags{
+	XE_DISCORD_PRIORITY = 0x1,
+	XE_DISCORD_MIC = 0x2,
+	XE_DISCORD_SOUNDSHARE = 0x4
+};
+
+#pragma pack(push, 1)
+
 struct xe_ip_discovery{
 	ushort type;
 	ushort length;
@@ -20,17 +39,47 @@ struct xe_ip_discovery{
 	ushort port;
 };
 
-enum xe_rtp_packet_type{
-	XE_RTP_OPUS = 120,
-	XE_RTP_SENDER_REPORT = 200,
-	XE_RTP_RECEIVER_REPORT = 201
+struct xe_rtp_extension_header{
+	ushort extension;
+	ushort length;
 };
 
 struct xe_rtp_header{
-	byte header;
+	byte flags;
 	byte packet_type;
-	ushort length;
+
+	union{
+		ushort report_length;
+		ushort sequence;
+	};
+
+	union{
+		uint report_ssrc;
+		uint timestamp;
+	};
+
 	uint ssrc;
+	xe_rtp_extension_header extension_header;
+
+	byte version(){
+		return flags >> 6;
+	}
+
+	byte extension(){
+		return (flags >> 4) & 1;
+	}
+
+	byte contributing_sources(){
+		return flags & 0xf;
+	}
+
+	byte marker(){
+		return packet_type >> 7;
+	}
+
+	byte report_count(){
+		return flags & 0x3f;
+	}
 };
 
 struct xe_rtp_receiver_report{
@@ -41,6 +90,8 @@ struct xe_rtp_receiver_report{
 	uint last_sr;
 	uint delay_since_last_sr;
 };
+
+#pragma pack(pop)
 
 int xe_voice_connection::ready(xe_request& ws){
 	xe_voice_connection& conn = xe_containerof(ws, &xe_voice_connection::ws);
@@ -130,7 +181,7 @@ int xe_voice_connection::message(xe_request& ws, xe_websocket_op ws_op, xe_vecto
 			);
 
 			conn.rtc_addr = message.ready.ip;
-			conn.rtc_port = xe_htons(message.ready.port);
+			conn.rtc_port = xe_hton(message.ready.port);
 			conn.ssrc = message.ready.ssrc;
 			/* pick the lowest bit set */
 			conn.encryption_mode = (xe_encryption_mode)(1 << xe_ctz(message.ready.encryption_modes));
@@ -155,10 +206,10 @@ int xe_voice_connection::message(xe_request& ws, xe_websocket_op ws_op, xe_vecto
 		case XE_OP_SESSION_DESCRIPTION:
 			xe_log_verbose(&conn, ">> ws session_description: encryption_mode = %s, secret_key = %08lx%08lx%08lx%08lx",
 				xe_encryption_mode_to_string(message.session_description.encryption_mode),
-				xe_htonll(*(ulong*)&message.session_description.secret_key[0]),
-				xe_htonll(*(ulong*)&message.session_description.secret_key[8]),
-				xe_htonll(*(ulong*)&message.session_description.secret_key[16]),
-				xe_htonll(*(ulong*)&message.session_description.secret_key[24])
+				xe_ntoh(*(ulong*)&message.session_description.secret_key[0]),
+				xe_ntoh(*(ulong*)&message.session_description.secret_key[8]),
+				xe_ntoh(*(ulong*)&message.session_description.secret_key[16]),
+				xe_ntoh(*(ulong*)&message.session_description.secret_key[24])
 			);
 
 			conn.encryption.init(message.session_description.encryption_mode, message.session_description.secret_key);
@@ -242,26 +293,26 @@ void xe_voice_connection::set_state(xe_voice_connection_state state_){
 
 void xe_voice_connection::handle_ip_discovery(const xe_slice<byte>& data){
 	xe_ip_discovery& discovery = *(xe_ip_discovery*)data.data();
-	uint mlen, mssrc, iplen;
-	ushort port, header;
+	uint mlen, iplen;
+	ushort port;
 	in_addr addr;
 	xe_message message;
 
-	if(data.size() < 10 || data.size() > 74)
+	if(data.size() != 74)
 		return;
-	mlen = xe_ntohs(discovery.length) + 4;
+	mlen = xe_ntoh(discovery.length) + 4;
 
-	if(xe_ntohs(discovery.type) != 0x02 ||
-		xe_htonl(discovery.ssrc) != ssrc ||
-		data.size() != mlen || mlen != 74)
+	if(xe_ntoh(discovery.type) != 0x02 ||
+		xe_hton(discovery.ssrc) != ssrc ||
+		mlen != 74)
 		return;
 	xe_string_view ip(discovery.ip.begin(), discovery.ip.size());
 
 	iplen = ip.index_of(0);
 
-	if(iplen == -1 || inet_pton(AF_INET, (char*)&data[8], &addr) != 1)
+	if(iplen == (uint)-1 || inet_pton(AF_INET, (char*)&data[8], &addr) != 1)
 		return;
-	port = xe_ntohs(discovery.port);
+	port = xe_ntoh(discovery.port);
 
 	start_timer(rtc_heartbeat, 5'000);
 	xe_log_verbose(this, ">> udp ip discovery: ip = %s port = %u", ip.data(), port);
@@ -296,36 +347,95 @@ void xe_voice_connection::handle_heartbeat(const xe_slice<byte>& data){
 
 void xe_voice_connection::handle_rtp(const xe_slice<byte>& data){
 	xe_rtp_header& header = *(xe_rtp_header*)&data[0];
-	const uint header_size = 8, report_size = 24;
-
-	if(data.size() < header_size ||
-		(header.header & 0xb0) != 0x80) /* rtp version 2 */
-		return;
-	if(header.packet_type != XE_RTP_RECEIVER_REPORT || xe_ntohl(header.ssrc) != ssrc)
-		return;
 	xe_fla<byte, 1500> plaintext;
-	int plaintext_len = encryption.decrypt(plaintext.data(), data.data(), data.size(), header_size);
+	int plaintext_len;
+	uint header_size = 8;
+
+	if(data.size() < header_size || header.version() != 2)
+		return;
+	if(header.packet_type == XE_RTP_RECEIVER_REPORT){
+		if(xe_ntoh(header.report_ssrc) != ssrc) return;
+	}else if(header.packet_type == XE_RTP_OPUS){
+		header_size = 12;
+
+		if(header.extension())
+			header_size += 4;
+		if(data.size() < header_size)
+			return;
+	}else{
+		return;
+	}
+
+	plaintext_len = encryption.decrypt(plaintext.data(), data.data(), data.size(), header_size);
 
 	if(plaintext_len < 0)
 		return;
-	uint length = (xe_ntohs(header.length) + 1) * 4;
-	uint report_count = header.header & 0x3f;
+	if(header.packet_type == XE_RTP_RECEIVER_REPORT){
+		constexpr uint report_size = 24;
+		uint length = (xe_ntoh(header.report_length) + 1) * 4,
+			report_count = header.report_count();
+		if(length > plaintext_len + header_size || length < report_count * report_size + header_size)
+			return;
+		xe_rtp_receiver_report* reports = (xe_rtp_receiver_report*)&plaintext[0];
 
-	if(length > plaintext_len + header_size || length < report_count * report_size + header_size)
+		for(uint i = 0; i < report_count; i++){
+			xe_rtp_receiver_report& report = reports[i];
+
+			if(xe_ntoh(report.ssrc) != ssrc)
+				continue;
+			uint lost = xe_ntoh(report.lost);
+
+			xe_log_debug(this, ">> rtcp receiver report: "
+				"lost = %i (%.3f\%), jitter = %i, highest_seq = %u",
+				(int)(lost << 8) >> 8,
+				(lost >> 24) * 100.0f / 255,
+				xe_ntoh(report.interarrival_jitter),
+				xe_ntoh(report.highest_sequence)
+			);
+		}
+
 		return;
-	xe_rtp_receiver_report* reports = (xe_rtp_receiver_report*)&plaintext[0];
-
-	for(uint i = 0; i < report_count; i++){
-		xe_rtp_receiver_report& report = reports[i];
-		uint lost = xe_ntohl(report.lost);
-
-		xe_log_debug(this, ">> rtcp receiver report: "
-			"lost = %i (%.3f\%), jitter = %i",
-			(int)(lost << 8) >> 8,
-			(lost >> 24) * 100.0f / 255,
-			xe_ntohl(report.interarrival_jitter)
-		);
 	}
+
+	xe_slice<byte> opus_data = plaintext.slice(0, plaintext_len);
+	int loudness = 0;
+	uint speaking_flags = 0;
+
+	if(header.extension()){
+		uint profile = xe_hton(header.extension_header.extension),
+			length = xe_hton(header.extension_header.length) * 4;
+		if(plaintext_len < length)
+			return;
+		if(profile == 0xbede){
+			for(uint i = 0; i < length; i++){
+				uint id, len;
+
+				if(!plaintext[i])
+					continue;
+				id = plaintext[i] >> 4;
+				len = (plaintext[i] & 0xf) + 1;
+
+				if(i + len + 1 > length)
+					return;
+				if(id == XE_DISCORD_AUDIO_LEVEL)
+					loudness = -(plaintext[i + 1] & 0x7f);
+				else if(id == XE_DISCORD_SPEAKING_FLAGS)
+					speaking_flags = plaintext[i + 1];
+				i += len;
+			}
+		}
+
+		opus_data = plaintext.slice(length, plaintext_len);
+	}
+
+	xe_log_debug(this, ">> rtp opus: sequence = %u, timestamp = %u, ssrc = %u, loudness = %i dBov, speaking_flags = %#0x, len = %u",
+		xe_hton(header.sequence),
+		xe_hton(header.timestamp),
+		xe_hton(header.ssrc),
+		loudness,
+		speaking_flags,
+		opus_data.size()
+	);
 }
 
 void xe_voice_connection::rtc_poll_cb(xe_poll& poll, int result){

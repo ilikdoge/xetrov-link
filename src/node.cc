@@ -172,7 +172,7 @@ int xe_link_node::listen(const xe_string_view& addr, ushort port){
 	if(inet_pton(AF_INET, addr.data(), &in.sin_addr) != 1)
 		return XE_EINVAL;
 	in.sin_family = AF_INET;
-	in.sin_port = xe_htons(port);
+	in.sin_port = xe_hton(port);
 
 	xe_return_error(server.bind((sockaddr*)&in, sizeof(in)));
 	xe_return_error(server.listen(SOMAXCONN));
