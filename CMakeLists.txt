@@ -10,7 +10,7 @@ set(XE_ENABLE_XURL ON)
 set(XE_USE_WOLFSSL ON)
 set(XE_ENABLE_EXAMPLES OFF)
 
-FetchContent_Declare(xetrov GIT_REPOSITORY https://github.com/ilikdoge/xetrov.git GIT_TAG master)
+FetchContent_Declare(xetrov GIT_REPOSITORY https://github.com/davidzeng0/xetrov.git GIT_TAG master)
 FetchContent_MakeAvailable(xetrov)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20 -Wall")
